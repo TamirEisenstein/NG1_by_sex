@@ -1,0 +1,692 @@
+# =============================================================================
+# Sex-dependent dopaminergic vulnerability and Parkinson's disease risk
+# Sex differences in nigrosome-1 (NG-1) magnetic susceptibility (QSM)
+#
+# Analysis code for: Eisenstein, Lange, Hu & Klein
+# Data source: UK Biobank (Data Access Application 95506)
+#
+# This script reproduces the cross-sectional and longitudinal analyses of
+# NG-1 QSM signal reported in the manuscript and supplement.
+#
+# REPRODUCIBILITY NOTES
+#  - UK Biobank data cannot be redistributed. This script expects an analysis
+#    table (one row per participant) at the path set in the CONFIG block below.
+#    No data are included in this repository.
+#  - The script is written to run top-to-bottom on that table.
+# =============================================================================
+
+
+# =============================================================================
+# 0. CONFIG  -- edit these paths only
+# =============================================================================
+library(readxl)
+
+# Directory for all figures and result tables.
+out_dir <- "directory/of/choice"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Reproducibility
+set.seed(123)
+
+
+# =============================================================================
+# 1. DEPENDENCIES
+#    Only packages actually used below are loaded.
+# =============================================================================
+
+# Modelling
+library(mgcv)        # gam(), bam(), s(), predict(type = "lpmatrix")
+library(gamm4)       # gamm4() generalized additive mixed models
+library(lme4)        # lmer(), lmerControl()
+library(lmerTest)    # p-values for lmer()
+library(performance) # icc()
+library(gratia)      # smooths(), conditional_values(), draw()
+
+# Tidyverse / data wrangling
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(forcats)
+library(readr)
+library(broom)
+
+# Plotting
+library(ggplot2)
+library(sjPlot)      # plot_model()
+
+
+# =============================================================================
+# 2. HELPER FUNCTIONS AND SHARED SETTINGS
+# =============================================================================
+
+# Consistent sex colour scheme across all figures (Female, Male)
+group_colors <- c("cyan4", "red3")
+
+# Shared ggplot theme so every panel matches
+theme_paper <- function() {
+  theme_bw() +
+    theme(
+      axis.text.x  = element_text(size = 17),
+      axis.text.y  = element_text(size = 17),
+      axis.title.x = element_text(size = 17),
+      axis.title.y = element_text(size = 17),
+      plot.title   = element_text(size = 17, face = "bold"),
+      legend.position = "none"
+    )
+}
+
+# Predicted fit + Wald 95% CI for a GAM via the lpmatrix (delta-method) approach.
+# Returns the linear-predictor fit and SE; correct for contrasts because it uses
+# the full coefficient covariance matrix rather than naive sqrt(se1^2 + se2^2).
+predict_lp <- function(model, newdata, beta = coef(model), Vb = vcov(model)) {
+  Xp  <- predict(model, newdata = newdata, type = "lpmatrix")
+  fit <- as.vector(Xp %*% beta)
+  se  <- sqrt(rowSums((Xp %*% Vb) * Xp))   # diag(Xp Vb Xp')
+  data.frame(fit = fit, se = se, lower = fit - 1.96 * se, upper = fit + 1.96 * se)
+}
+
+# Mean (male) - (female) contrast at matched covariate rows, with correct SE.
+sex_contrast_lp <- function(model, newdata, male = "Male", female = "Female",
+                            sex_levels, beta = coef(model), Vb = vcov(model)) {
+  nd_m <- transform(newdata, sex = factor(male,   levels = sex_levels))
+  nd_f <- transform(newdata, sex = factor(female, levels = sex_levels))
+  Xdiff <- predict(model, nd_m, type = "lpmatrix") -
+    predict(model, nd_f, type = "lpmatrix")
+  diff <- as.vector(Xdiff %*% beta)
+  se   <- sqrt(rowSums((Xdiff %*% Vb) * Xdiff))
+  data.frame(diff = diff, se = se, lower = diff - 1.96 * se, upper = diff + 1.96 * se)
+}
+
+
+# =============================================================================
+# 3. LOAD AND FILTER DATA
+# =============================================================================
+
+ng1 <- read.csv("../data_file.csv",
+                   header=T, na.strings=c("","NA"))
+
+# Exclude participants with major neurodegenerative / cerebrovascular disease
+# (diagnoses and self-report). See supplement for ICD-10 / self-report codes.
+ng1 <- ng1 %>%
+  filter(
+    is.na(cerebrovascular_first_date),
+    MS_demyalination_history          == 0,
+    dementia_history                  == 0,
+    parkinsonism_history              == 0,
+    stroke_cerebrovascular_self_report == 0,
+    dementia_self_report              == 0,
+    parkinsonism_self_report          == 0,
+    MS_self_report                    == 0
+  )
+
+# Factor coding. Female is the reference level so the sex term reports the
+# male-vs-female difference (sexMale).
+ng1$sex    <- relevel(factor(ng1$sex), ref = "Female")
+ng1$site <- factor(ng1$site)
+
+# Derived binary smoking variable used in sensitivity analyses
+ng1$new_smoking <- dplyr::case_when(
+  ng1$Smoking_status_Instance_2 %in% c("Previous", "Current") ~ 1,
+  ng1$Smoking_status_Instance_2 == "Never"                    ~ 0,
+  TRUE                                                        ~ NA_real_
+)
+
+cat("Cross-sectional N:", nrow(ng1), "\n")
+print(table(ng1$sex))
+cat("Age range:", paste(range(ng1$age), collapse = " - "), "\n")
+
+# Name of the primary (bilateral-averaged, deconfounded) NG-1 outcome column
+outcome <- "DNH50_OMM_1mm_raw_deconfound_8MAD_repeated_instance2_avg"
+
+
+# =============================================================================
+# 4. CROSS-SECTIONAL ANALYSIS
+# =============================================================================
+
+cross_dir <- file.path(out_dir, "cross_sectional")
+dir.create(cross_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------------------------------------------------------
+# 4. Panel A: overall (sex-free) age trajectory of NG-1
+#   Fit on the pooled sample with NO sex terms. This is the model that
+#   corresponds to "the NG-1 age-related trajectory in the whole sample".
+#   Report THIS smooth's edf / p as the overall trajectory statistic.
+# -----------------------------------------------------------------------------
+gam_cross_overall <- gam(
+  as.formula(paste0(
+    outcome, " ~ ",
+    "s(age, k = 20, bs = 'cr') + ",   # overall age trajectory
+    "s(site, bs = 're')"                      # assessment-centre RE
+  )),
+  data = ng1, na.action = na.exclude
+)
+
+# This summary gives the edf / p for the overall trajectory reported in text
+summary(gam_cross_overall)
+k.check(gam_cross_overall, subsample = 500, n.rep = 500)
+
+# Figure 2A: pooled trajectory with 95% CI ribbon.
+# Predictions come out near the GRAND MEAN (~52-53 ppb), i.e. ~5 ppb above the
+# female-only curve that the old panel A was actually showing.
+pred_overall <- with(
+  data.frame(age = seq(min(ng1$age, na.rm = TRUE),
+                                 max(ng1$age, na.rm = TRUE),
+                                 length.out = 200),
+             site = factor(levels(ng1$site)[1], levels = levels(ng1$site))),
+  cbind(data.frame(age = age),
+        predict_lp(gam_cross_overall,
+                   data.frame(age = age, site = site)))
+)
+
+fig_overall <- ggplot(pred_overall, aes(age, fit)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#2b5460", alpha = 0.15) +
+  geom_line(color = "#2b5460", linewidth = 1) +
+  labs(y = "Predicted QSM signal (ppb)", x = "Age (years)", tag = "A") +
+  coord_cartesian(x = c(45, 85)) +   # let y auto-scale, or set to ~c(48,58)
+  theme_paper()
+
+ggsave(file.path(cross_dir, "fig2A_NG1_overall_trajectory.png"),
+       fig_overall, width = 6.5, height = 6.5, dpi = 600, bg = "white")
+
+# -----------------------------------------------------------------------------
+# 4a. Primary GAM: age trajectory + mean sex difference + age x sex smooth
+# -----------------------------------------------------------------------------
+# Note: formula built with paste(), not reformulate(), because reformulate()
+# can back-tick-quote smooth terms like s(age, by = sex) and break them.
+gam_cross <- gam(
+  as.formula(paste0(
+    outcome, " ~ ",
+    "s(age, by = sex, k = 20, bs = 'cr') + ",  # age x sex shape
+    "sex + ",                                            # mean sex difference
+    "s(age, k = 20, bs = 'cr') + ",            # overall age trajectory
+    "s(site, bs = 're')"                               # assessment-centre RE
+  )),
+  data = ng1, na.action = na.exclude
+)
+
+summary(gam_cross)
+k.check(gam_cross, subsample = 500, n.rep = 500)
+
+# Figure 2A/2B: predicted NG-1 trajectories by sex
+sms <- smooths(gam_cross)  # drop the site random-effect smooth from the plot
+fig_cross <- gam_cross |>
+  conditional_values(condition = c("age", "sex"),
+                     exclude = sms[grepl("site", sms)]) |>
+  draw() +
+  labs(y = "Predicted QSM signal (ppb)", x = "Age (years)", tag = "A") +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+#  coord_cartesian(y = c(25, 110), x = c(45, 85)) +
+  theme_paper()
+
+ggsave(file.path(cross_dir, "fig2_NG1_by_sex_cross_sectional.png"),
+       fig_cross, width = 6.5, height = 6.5, dpi = 600, bg = "white")
+
+# Parametric coefficient table with Wald 95% CIs
+param_cross <- summary(gam_cross)$p.table %>%
+  as.data.frame() %>%
+  rownames_to_column("term") %>%
+  mutate(est = Estimate, se = `Std. Error`,
+         lower = est - 1.96 * se, upper = est + 1.96 * se) %>%
+  dplyr::select(term, est, se, lower, upper, `t value`, `Pr(>|t|)`)
+write.csv(param_cross,
+          file.path(cross_dir, "param_table_cross_sectional.csv"),
+          row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 4b. Restricted sub-sample (age 45-60): is the early-midlife decline real?
+#     Reported in main text as n = 14,456, edf = 1.00, p = 0.09.
+#     NOTE: an earlier draft restricted to 50-60; the manuscript reports 45-60,
+#     so the filter below is age < 60. Confirm n matches the reported 14,456.
+# -----------------------------------------------------------------------------
+ng1_u60 <- ng1 %>% filter(age < 60)
+cat("Sub-sample (age < 60) N:", nrow(ng1_u60), "\n")
+
+gam_cross_u60 <- gam(
+  as.formula(paste0(
+    outcome, " ~ ",
+    "s(age, by = sex, k = 20, bs = 'cr') + ",
+    "sex + ",
+    "s(age, k = 20, bs = 'cr') + ",
+    "s(site, bs = 're')"
+  )),
+  data = ng1_u60, na.action = na.exclude
+)
+summary(gam_cross_u60)
+
+# -----------------------------------------------------------------------------
+# 4c. Laterality check (supplement): left vs right NG-1
+#     Bilateral values are averaged for the main analyses; this confirms the
+#     left/right difference is negligible relative to between-subject variation.
+#     Uses the raw deconfounded left/right columns.
+# -----------------------------------------------------------------------------
+L_col <- "L_DNH50_OMM_1mm_raw_deconfound_8MAD_26oct"
+R_col <- "R_DNH50_OMM_1mm_raw_deconfound_8MAD_26oct"
+
+# Paired t-tests overall and by sex
+print(t.test(ng1[[R_col]], ng1[[L_col]], paired = TRUE))
+for (s in levels(ng1$sex)) {
+  d <- ng1[ng1$sex == s, ]
+  cat("\nLaterality paired t-test, sex =", s, "\n")
+  print(t.test(d[[R_col]], d[[L_col]], paired = TRUE))
+}
+
+# Linear mixed model: side x sex with participant random intercept
+lat_long <- ng1 %>%
+  pivot_longer(cols = all_of(c(R_col, L_col)),
+               names_to = "side", values_to = "NG1") %>%
+  mutate(side = if_else(str_detect(side, "^R_"), "right", "left"))
+
+lat_model <- lmer(NG1 ~ side * sex + (1 | ID_analysis_orig_x), data = lat_long)
+summary(lat_model)
+
+# -----------------------------------------------------------------------------
+# 4d. Cross-sectional sensitivity analyses: sex x predictor interactions
+#     Refit the primary GAM adding one moderator at a time; extract the
+#     sex x predictor interaction, FDR-correct across the family of moderators.
+# -----------------------------------------------------------------------------
+sensitivity_preds <- c(
+  "Standard_PRS_for_parkinsons_disease_PD",
+  "family_history_PD",
+  "manifest_CVD_instance2_with_self_report",
+  "manifest_diabetes_instance2_with_self_report",
+  "new_smoking",
+  "Alcohol_intake_frequency_Instance_2_edited",
+  "Higher_education_binary"
+)
+
+# Human-readable labels for plotting (kept in the same order as above)
+pred_labels <- c(
+  Standard_PRS_for_parkinsons_disease_PD       = "PRS for PD",
+  family_history_PD                            = "PD family history",
+  manifest_CVD_instance2_with_self_report      = "CVD",
+  manifest_diabetes_instance2_with_self_report = "Diabetes",
+  new_smoking                                  = "Smoking status",
+  Alcohol_intake_frequency_Instance_2_edited   = "Alcohol frequency",
+  Higher_education_binary                      = "Education level"
+)
+
+cross_sens <- purrr::map_dfr(sensitivity_preds, function(pred) {
+  message("Cross-sectional sensitivity model: ", pred)
+  fmla <- as.formula(paste0(
+    outcome, " ~ ",
+    "s(age, by = sex, k = 20, bs = 'cr') + ",
+    "s(age, k = 20, bs = 'cr') + ",
+    "sex * ", pred, " + ",
+    "s(site, bs = 're')"
+  ))
+  mod <- bam(fmla, data = ng1, method = "fREML", na.action = na.exclude)
+  
+  summary(mod)$p.table %>%
+    as.data.frame() %>%
+    rownames_to_column("term") %>%
+    # Keep the sex x predictor interaction term(s) for this model
+    filter(str_detect(term, "^sexMale:")) %>%
+    mutate(predictor = pred,
+           est = Estimate, se = `Std. Error`,
+           lower = est - 1.96 * se, upper = est + 1.96 * se) %>%
+    dplyr::select(predictor, term, est, se, lower, upper,
+                  `t value`, p = `Pr(>|t|)`)
+})
+
+# FDR across the family of sex x predictor interactions
+# NOTE: the manuscript reports these interactions as FDR-corrected (pFDR > 0.28).
+# Verify these adjusted p-values reproduce that statement.
+cross_sens <- cross_sens %>%
+  mutate(p_adj_fdr = p.adjust(p, method = "fdr"),
+         label = pred_labels[predictor])
+
+write.csv(cross_sens,
+          file.path(cross_dir, "cross_sectional_sensitivity_interactions.csv"),
+          row.names = FALSE)
+
+# Figure 2C: forest plot of sex x predictor interactions
+forest_cross <- ggplot(cross_sens,
+                       aes(x = est, y = fct_reorder(label, est))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_point(color = "steelblue", size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper),
+                 color = "steelblue", height = 0.2, linewidth = 1) +
+  geom_text(aes(label = sprintf("beta=%.2f [%.2f, %.2f], pFDR=%.2f",
+                                est, lower, upper, p_adj_fdr)),
+            vjust = -1, size = 4.25) +
+  labs(x = "Parameter estimate (Wald 95% CI)", y = NULL,
+       title = "Cross-sectional sensitivity: sex x predictor interactions") +
+  coord_cartesian(x = c(-5.5, 5)) +
+  theme_paper()
+
+ggsave(file.path(cross_dir, "fig2C_cross_sectional_sensitivity_forest.png"),
+       forest_cross, width = 7.5, height = 6.5, dpi = 600, bg = "white")
+
+
+# =============================================================================
+# 5. LONGITUDINAL ANALYSIS  (follows Ravndal et al., 2025)
+#    Age is decomposed into a between-person 'mean_age' (smooth) and a
+#    within-person 'time' (linear), so cross-sectional and longitudinal
+#    effects of age are separated.
+# =============================================================================
+
+long_dir <- file.path(out_dir, "longitudinal")
+dir.create(long_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------------------------------------------------------
+# 5a. Build the two-timepoint long-format dataset
+# -----------------------------------------------------------------------------
+out_t2 <- "DNH50_OMM_1mm_raw_deconfound_8MAD_repeated_instance2_avg"  # baseline
+out_t3 <- "DNH50_OMM_1mm_raw_deconfound_8MAD_repeated_instance3_avg"  # follow-up
+
+# Participants with a follow-up scan
+repeated <- ng1 %>%
+  filter(!is.na(L_DNH50_OMM_1mm_raw_deconfound_8MAD_repeated_instance3))
+
+cat("Longitudinal N (participants):", nrow(repeated), "\n")
+
+# Follow-up interval summary, overall and by sex (years)
+repeated <- repeated %>% mutate(gap_years = visit2_visit3_gap / 12)
+repeated %>%
+  summarise(mean = mean(gap_years, na.rm = TRUE),
+            sd   = sd(gap_years,   na.rm = TRUE),
+            min  = min(gap_years,  na.rm = TRUE),
+            max  = max(gap_years,  na.rm = TRUE))
+repeated %>%
+  group_by(sex) %>%
+  summarise(mean = mean(gap_years, na.rm = TRUE),
+            sd   = sd(gap_years,   na.rm = TRUE),
+            min  = min(gap_years,  na.rm = TRUE),
+            max  = max(gap_years,  na.rm = TRUE), .groups = "drop")
+
+keep_cols <- c("ID_analysis_orig_x", "age", "sex", out_t2, out_t3,
+               "visit2_visit3_gap", "age_visit3",
+               "Standard_PRS_for_parkinsons_disease_PD", "family_history_PD",
+               "new_smoking", "Alcohol_intake_frequency_Instance_2_edited",
+               "Higher_education_binary",
+               "manifest_CVD_instance2_with_self_report",
+               "manifest_diabetes_instance2_with_self_report", "site")
+
+df_long <- repeated %>%
+  dplyr::select(all_of(keep_cols)) %>%
+  pivot_longer(cols = c(age, age_visit3),
+               names_to = "visit", values_to = "age_at_scan") %>%
+  mutate(visit  = recode(visit, age = "baseline", age_visit3 = "followup"),
+         QSM_adj = if_else(visit == "baseline", .data[[out_t2]], .data[[out_t3]])) %>%
+  group_by(ID_analysis_orig_x) %>%
+  mutate(mean_age = mean(age_at_scan, na.rm = TRUE),
+         time     = age_at_scan - mean_age) %>%
+  ungroup() %>%
+  mutate(mean_age_c = mean_age - mean(mean_age, na.rm = TRUE),
+         time_c     = time)
+
+# Factor coding for grouping / random effects
+df_long$sex                          <- relevel(factor(df_long$sex), ref = "Female")
+df_long$ID_subject                   <- factor(df_long$ID_analysis_orig_x)
+df_long$UK_Biobank_assessment_centre <- factor(df_long$site)
+
+sex_levels <- levels(df_long$sex)
+
+# Random-effects structure used throughout: random intercept + slope of time
+# per participant, plus a random intercept for assessment centre.
+random_effects <- ~ (1 + time_c | ID_subject) + (1 | UK_Biobank_assessment_centre)
+k_basis <- 20
+
+# -----------------------------------------------------------------------------
+# 5b. Primary GAMM: within-person change and its moderation by age
+#     (no sex interactions yet) -> Figure 3A / 3B
+# -----------------------------------------------------------------------------
+gamm_main <- gamm4(
+  QSM_adj ~ s(mean_age_c, k = k_basis, bs = "cr") +
+    sex + time_c + time_c:mean_age_c,
+  random  = random_effects,
+  data    = df_long, REML = TRUE,
+  control = lmerControl(check.nobs.vs.nRE = "ignore")
+)
+summary(gamm_main$gam)
+
+# Figure 3A: within-person change over time
+fig_time <- plot_model(gamm_main, type = "pred",
+                       terms = "time_c [all]", show.data = FALSE,
+                       colors = "#2b5460") +
+  labs(y = "Predicted QSM signal (ppb)", x = "Time from mean age (years)") +
+  coord_cartesian(y = c(40, 52.5)) +
+  theme_paper()
+ggsave(file.path(long_dir, "fig3A_NG1_time.png"),
+       fig_time, width = 6.5, height = 6.5, dpi = 600, bg = "white")
+
+# Figure 3B: time x age (sex-averaged) at ages 55 / 65 / 75
+age_mean   <- mean(df_long$age_at_scan, na.rm = TRUE)
+time_seq   <- seq(-3.5, 3.5, by = 0.1)   # within observed within-person range
+target_age <- c(55, 65, 75)
+
+grid_age <- expand.grid(time_c = time_seq, raw_age = target_age, sex = sex_levels) %>%
+  mutate(mean_age_c = raw_age - age_mean,
+         sex = factor(sex, levels = sex_levels))
+
+# Sex-averaged marginal prediction (weight by empirical sex proportions)
+beta <- coef(gamm_main$gam); Vb <- vcov(gamm_main$gam)
+Xp   <- predict(gamm_main$gam, grid_age, type = "lpmatrix")
+w    <- as.numeric(prop.table(table(df_long$sex))[as.character(grid_age$sex)])
+Xpw  <- sweep(Xp, 1, w, "*")
+grp  <- interaction(grid_age$time_c, grid_age$raw_age, drop = TRUE)
+Xpm  <- rowsum(Xpw, grp, reorder = FALSE)
+
+pred_time_age <- expand.grid(time_c = time_seq, raw_age = target_age) %>%
+  mutate(fit   = as.vector(Xpm %*% beta),
+         se    = sqrt(rowSums((Xpm %*% Vb) * Xpm)),
+         lower = fit - 1.96 * se, upper = fit + 1.96 * se,
+         raw_age = factor(raw_age, levels = target_age))
+
+fig_time_age <- ggplot(pred_time_age, aes(time_c, fit)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#2b5460", alpha = 0.15) +
+  geom_line(color = "#2b5460", linewidth = 1) +
+  facet_wrap(~ raw_age, nrow = 1,
+             labeller = labeller(raw_age = function(x) paste0("Age = ", x, " yrs"))) +
+  labs(x = "Time from mean age (years)", y = "Predicted QSM signal (ppb)",
+       title = "time x age trajectories (sex-averaged)") +
+  coord_cartesian(y = c(45, 62.5)) +
+  theme_paper() +
+  theme(panel.spacing = unit(1, "lines"),
+        plot.title = element_text(hjust = 0.5))
+ggsave(file.path(long_dir, "fig3B_NG1_time_by_age.png"),
+       fig_time_age, width = 7.5, height = 6.5, dpi = 600, bg = "white")
+
+# -----------------------------------------------------------------------------
+# 5c. GAMM with sex interactions: time x sex and time x sex x mean_age
+#     -> Figure 3C / 3D and the reported interaction statistics
+# -----------------------------------------------------------------------------
+gamm_sex <- gamm4(
+  QSM_adj ~ s(mean_age_c, by = sex, k = k_basis, bs = "cr") +
+    sex + time_c + time_c:sex + time_c:mean_age_c +
+    time_c:sex:mean_age_c,
+  random  = random_effects,
+  data    = df_long, REML = TRUE,
+  control = lmerControl(check.nobs.vs.nRE = "ignore")
+)
+summary(gamm_sex$gam)
+
+# Diagnostics
+gam.check(gamm_sex$gam)
+mgcv::concurvity(gamm_sex$gam)
+performance::icc(gamm_sex$mer)
+
+# Parametric coefficient table with Wald 95% CIs
+param_long <- summary(gamm_sex$gam)$p.table %>%
+  as.data.frame() %>%
+  rownames_to_column("term") %>%
+  mutate(est = Estimate, se = `Std. Error`,
+         lower = est - 1.96 * se, upper = est + 1.96 * se) %>%
+  dplyr::select(term, est, se, lower, upper, `t value`, `Pr(>|t|)`)
+write.csv(param_long,
+          file.path(long_dir, "param_table_longitudinal.csv"),
+          row.names = FALSE)
+
+# Predictions for plotting -------------------------------------------------
+beta <- coef(gamm_sex$gam); Vb <- vcov(gamm_sex$gam)
+
+# Figure 3C: time x sex at the sample mean age
+grid_time_sex <- expand.grid(time_c = time_seq, sex = sex_levels,
+                             mean_age_c = mean(df_long$mean_age_c, na.rm = TRUE)) %>%
+  mutate(sex = factor(sex, levels = sex_levels))
+pred_time_sex <- cbind(grid_time_sex, predict_lp(gamm_sex$gam, grid_time_sex, beta, Vb))
+
+fig_time_sex <- ggplot(pred_time_sex, aes(time_c, fit, color = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  labs(x = "Time from mean age (years)", y = "Predicted QSM signal (ppb)", tag = "C") +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  ggtitle("NG-1 trajectories: time x sex") +
+  theme_paper() +
+  theme(plot.title = element_text(hjust = 0.5))
+ggsave(file.path(long_dir, "fig3C_NG1_time_by_sex.png"),
+       fig_time_sex, width = 6.5, height = 6.5, dpi = 600, bg = "white")
+
+# Figure 3D: time x sex at ages 55 / 65 / 75
+grid_ast <- expand.grid(time_c = time_seq, sex = sex_levels, raw_age = target_age) %>%
+  mutate(mean_age_c = raw_age - age_mean,
+         sex = factor(sex, levels = sex_levels))
+pred_ast <- cbind(grid_ast, predict_lp(gamm_sex$gam, grid_ast, beta, Vb))
+
+fig_ast <- ggplot(pred_ast, aes(time_c, fit, color = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ raw_age, nrow = 1,
+             labeller = labeller(raw_age = function(x) paste0("Age = ", x, " yrs"))) +
+  labs(x = "Time from mean age (years)", y = "Predicted QSM signal (ppb)", tag = "D") +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  ggtitle("NG-1 trajectories: time x sex x age") +
+  coord_cartesian(y = c(20, 75)) +
+  theme_paper() +
+  theme(panel.spacing = unit(1, "lines"),
+        plot.title = element_text(hjust = 0.5))
+ggsave(file.path(long_dir, "fig3D_NG1_time_by_sex_by_age.png"),
+       fig_ast, width = 7.5, height = 6.5, dpi = 600, bg = "white")
+
+# Sex difference (male - female) in trajectory, by age, with correct contrast SE
+grid_contrast <- expand.grid(time_c = time_seq, raw_age = target_age) %>%
+  mutate(mean_age_c = raw_age - age_mean)
+contrast_df <- cbind(grid_contrast,
+                     sex_contrast_lp(gamm_sex$gam, grid_contrast,
+                                     sex_levels = sex_levels))
+contrast_df$raw_age <- factor(contrast_df$raw_age, levels = target_age)
+
+fig_contrast <- ggplot(contrast_df, aes(time_c, diff)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = raw_age), alpha = 0.15, color = NA) +
+  geom_line(aes(color = raw_age), linewidth = 1) +
+  facet_wrap(~ raw_age, nrow = 1,
+             labeller = labeller(raw_age = function(x) paste0("Age = ", x, " yrs"))) +
+  labs(x = "Time from mean age (years)",
+       y = "Sex difference in QSM signal (ppb)") +
+  ggtitle("Sex differences in NG-1 trajectories (male - female)") +  # bilateral mean
+  coord_cartesian(y = c(0, 25)) +
+  theme_paper() +
+  theme(panel.spacing = unit(1, "lines"),
+        plot.title = element_text(hjust = 0.5))
+ggsave(file.path(long_dir, "NG1_sex_difference_by_age.png"),
+       fig_contrast, width = 7.5, height = 6.5, dpi = 600, bg = "white")
+
+# -----------------------------------------------------------------------------
+# 5d. Longitudinal sensitivity analyses: time x sex x predictor (3-way)
+#     The 3-way contrast is the difference, between predictor levels, in the
+#     sex difference of the within-person time slope. Computed via a numeric
+#     derivative of the lpmatrix in time so it is exact under the fitted model.
+# -----------------------------------------------------------------------------
+# Factor-code categorical moderators
+for (v in c("family_history_PD", "new_smoking",
+            "Alcohol_intake_frequency_Instance_2_edited", "Higher_education_binary",
+            "manifest_CVD_instance2_with_self_report",
+            "manifest_diabetes_instance2_with_self_report")) {
+  df_long[[v]] <- factor(df_long[[v]])
+}
+
+delta <- 1e-3  # step for the numeric time-derivative
+
+# Time-slope linear-predictor row for a given sex and predictor value
+slope_row <- function(model, sex_level, pred, pred_value) {
+  nd_p <- data.frame(mean_age_c = 0, time_c =  delta,
+                     sex = factor(sex_level, levels = sex_levels))
+  nd_m <- data.frame(mean_age_c = 0, time_c = -delta,
+                     sex = factor(sex_level, levels = sex_levels))
+  if (is.factor(df_long[[pred]])) {
+    nd_p[[pred]] <- factor(pred_value, levels = levels(df_long[[pred]]))
+    nd_m[[pred]] <- factor(pred_value, levels = levels(df_long[[pred]]))
+  } else {
+    nd_p[[pred]] <- pred_value; nd_m[[pred]] <- pred_value
+  }
+  (predict(model, nd_p, type = "lpmatrix") -
+      predict(model, nd_m, type = "lpmatrix")) / (2 * delta)
+}
+
+long_sens <- purrr::map_dfr(sensitivity_preds, function(pred) {
+  message("Longitudinal sensitivity model: ", pred)
+  fmla <- as.formula(paste0(
+    "QSM_adj ~ s(mean_age_c, by = sex, k = ", k_basis, ", bs = 'cr') + ",
+    "sex + time_c + time_c:sex + ",
+    pred, " + sex:", pred, " + time_c:", pred, " + time_c:sex:", pred
+  ))
+  mod <- tryCatch(
+    gamm4(fmla, random = random_effects, data = df_long, REML = TRUE,
+          control = lmerControl(check.nobs.vs.nRE = "ignore"),
+          na.action = na.exclude),
+    error = function(e) { warning("Failed for ", pred, ": ", conditionMessage(e)); NULL }
+  )
+  if (is.null(mod)) return(NULL)
+  
+  g <- mod$gam; b <- coef(g); V <- vcov(g)
+  
+  # Determine predictor levels/values to contrast
+  if (is.factor(df_long[[pred]])) {
+    lv  <- levels(df_long[[pred]]); ref <- lv[1]; alts <- lv[-1]
+  } else {
+    ref <- 0; alts <- 1
+  }
+  
+  purrr::map_dfr(alts, function(lvl) {
+    L <- (slope_row(g, "Male",   pred, lvl) - slope_row(g, "Female", pred, lvl)) -
+      (slope_row(g, "Male",   pred, ref) - slope_row(g, "Female", pred, ref))
+    est <- as.numeric(L %*% b)
+    se  <- sqrt(rowSums((L %*% V) * L))
+    t   <- est / se
+    tibble(predictor = pred,
+           level = as.character(lvl),
+           est = est, se = se,
+           lower = est - 1.96 * se, upper = est + 1.96 * se,
+           t = t, p = 2 * pnorm(-abs(t)))
+  })
+})
+
+# FDR across the family of 3-way contrasts
+long_sens <- long_sens %>%
+  mutate(p_adj_fdr = p.adjust(p, method = "fdr"),
+         label = pred_labels[predictor])
+
+write.csv(long_sens,
+          file.path(long_dir, "longitudinal_sensitivity_threeway_contrasts.csv"),
+          row.names = FALSE)
+
+# Figure 3E: forest plot of 3-way interactions
+forest_long <- ggplot(long_sens, aes(x = est, y = fct_reorder(label, est))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_point(color = "steelblue", size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper),
+                 color = "steelblue", height = 0.2, linewidth = 1) +
+  geom_text(aes(label = sprintf("beta=%.2f [%.2f, %.2f], pFDR=%.2f",
+                                est, lower, upper, p_adj_fdr)),
+            vjust = -1, size = 4.25) +
+  labs(x = "Parameter estimate (Wald 95% CI)", y = NULL,
+       title = "Longitudinal sensitivity: time x sex x predictor interactions") +
+  coord_cartesian(x = c(-5.5, 5)) +
+  theme_paper()
+
+ggsave(file.path(long_dir, "fig3E_longitudinal_sensitivity_forest.png"),
+       forest_long, width = 7.5, height = 6.5, dpi = 600, bg = "white")
+
+
+# =============================================================================
+# 6. SESSION INFO  (record exact package versions for reproducibility)
+# =============================================================================
+writeLines(capture.output(sessionInfo()),
+           file.path(out_dir, "sessionInfo.txt"))
+
+message("Analysis complete. Outputs written to: ", normalizePath(out_dir))
